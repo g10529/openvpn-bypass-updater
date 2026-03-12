@@ -1,0 +1,30 @@
+# One domain per line. Blank lines and lines starting with # are ignored.
+# Start broad enough for login, landing pages, redirects, and PDF/static asset hosts.
+
+www.sciencedirect.com
+sciencedirect.com
+api.elsevier.com
+www.elsevier.com
+linkinghub.elsevier.com
+id.elsevier.com
+auth.elsevier.com
+www.sciencedirectassets.com
+pdf.sciencedirectassets.com
+cdn.sciencedirect.com
+www.cell.com
+cell.com
+www.thelancet.com
+thelancet.com
+www.webofscience.com
+webofscience.com
+www.webofknowledge.com
+webofknowledge.com
+clarivate.com
+www.clarivate.com
+access.clarivate.com
+login.clarivate.com
+webofscience.help.clarivate.com
+researcherid.com
+www.researcherid.com
+publons.com
+www.publons.com
