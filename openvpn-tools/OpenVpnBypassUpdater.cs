@@ -160,40 +160,171 @@ internal static class Program
 
     private static OpenVpnSession FindCurrentSession()
     {
-        const string query = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='openvpn.exe'";
-        using (var searcher = new ManagementObjectSearcher(query))
+        List<OpenVpnSession> sessions = TryFindSessionsFromProcessCommandLine();
+        if (sessions.Count > 0)
         {
-            var sessions = new List<OpenVpnSession>();
-            foreach (ManagementObject process in searcher.Get())
-            {
-                string commandLine = process["CommandLine"] == null ? null : process["CommandLine"].ToString();
-                if (string.IsNullOrWhiteSpace(commandLine) || commandLine.IndexOf("--config", StringComparison.OrdinalIgnoreCase) < 0)
-                {
-                    continue;
-                }
-
-                string configArgument = ExtractArgument(commandLine, "--config");
-                if (string.IsNullOrWhiteSpace(configArgument))
-                {
-                    continue;
-                }
-
-                uint processId = Convert.ToUInt32(process["ProcessId"]);
-                string profileName = Path.GetFileNameWithoutExtension(configArgument);
-                string logAppend = ExtractArgument(commandLine, "--log-append");
-
-                sessions.Add(new OpenVpnSession(processId, profileName, configArgument, logAppend));
-            }
-
-            if (sessions.Count == 0)
-            {
-                throw new InvalidOperationException("No active OpenVPN connection was found. Connect VPN first, then run this updater.");
-            }
-
             return sessions
                 .OrderByDescending(s => s.ProcessId)
                 .First();
         }
+
+        LogSessionState logState = TryFindConnectedSessionFromLogs();
+        if (logState != null)
+        {
+            return new OpenVpnSession(0, logState.ProfileName, logState.ProfileName + ".ovpn", logState.LogPath);
+        }
+
+        LogSessionState latestAnyLog = TryFindLatestLogState();
+        if (latestAnyLog != null)
+        {
+            throw new InvalidOperationException(
+                "No connected OpenVPN session was detected. " +
+                "Latest log: " + latestAnyLog.ProfileName + " -> " + latestAnyLog.LastStatus + ".");
+        }
+
+        throw new InvalidOperationException("No active OpenVPN connection was found. Connect VPN first, then run this updater.");
+    }
+
+    private static List<OpenVpnSession> TryFindSessionsFromProcessCommandLine()
+    {
+        var sessions = new List<OpenVpnSession>();
+
+        try
+        {
+            const string query = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='openvpn.exe'";
+            using (var searcher = new ManagementObjectSearcher(query))
+            {
+                foreach (ManagementObject process in searcher.Get())
+                {
+                    string commandLine = process["CommandLine"] == null ? null : process["CommandLine"].ToString();
+                    if (string.IsNullOrWhiteSpace(commandLine) || commandLine.IndexOf("--config", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    string configArgument = ExtractArgument(commandLine, "--config");
+                    if (string.IsNullOrWhiteSpace(configArgument))
+                    {
+                        continue;
+                    }
+
+                    uint processId = Convert.ToUInt32(process["ProcessId"]);
+                    string profileName = Path.GetFileNameWithoutExtension(configArgument);
+                    string logAppend = ExtractArgument(commandLine, "--log-append");
+
+                    sessions.Add(new OpenVpnSession(processId, profileName, configArgument, logAppend));
+                }
+            }
+        }
+        catch
+        {
+            return new List<OpenVpnSession>();
+        }
+
+        return sessions;
+    }
+
+    private static LogSessionState TryFindConnectedSessionFromLogs()
+    {
+        string logDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "OpenVPN",
+            "log");
+
+        if (!Directory.Exists(logDirectory))
+        {
+            return null;
+        }
+
+        var states = new List<LogSessionState>();
+        foreach (string logPath in Directory.GetFiles(logDirectory, "*.log"))
+        {
+            LogSessionState state = ParseLogSessionState(logPath);
+            if (state != null)
+            {
+                states.Add(state);
+            }
+        }
+
+        return states
+            .Where(s => s.IsConnected)
+            .OrderByDescending(s => s.LastWriteTimeUtc)
+            .FirstOrDefault();
+    }
+
+    private static LogSessionState TryFindLatestLogState()
+    {
+        string logDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "OpenVPN",
+            "log");
+
+        if (!Directory.Exists(logDirectory))
+        {
+            return null;
+        }
+
+        return Directory.GetFiles(logDirectory, "*.log")
+            .Select(ParseLogSessionState)
+            .Where(s => s != null)
+            .OrderByDescending(s => s.LastWriteTimeUtc)
+            .FirstOrDefault();
+    }
+
+    private static LogSessionState ParseLogSessionState(string logPath)
+    {
+        FileInfo fileInfo = new FileInfo(logPath);
+        string[] lines;
+
+        try
+        {
+            lines = File.ReadAllLines(logPath);
+        }
+        catch
+        {
+            return null;
+        }
+
+        bool connected = false;
+        string lastStatus = "unknown";
+
+        foreach (string line in lines)
+        {
+            if (line.IndexOf("CONNECTED,SUCCESS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                line.IndexOf("Initialization Sequence Completed", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                connected = true;
+                lastStatus = "connected";
+                continue;
+            }
+
+            if (line.IndexOf("EXITING,SIGTERM", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                connected = false;
+                lastStatus = "exiting";
+                continue;
+            }
+
+            if (line.IndexOf("Exiting due to fatal error", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                connected = false;
+                lastStatus = "fatal error";
+                continue;
+            }
+
+            if (line.IndexOf("RECONNECTING", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                connected = false;
+                lastStatus = "reconnecting";
+            }
+        }
+
+        return new LogSessionState(
+            Path.GetFileNameWithoutExtension(logPath),
+            logPath,
+            connected,
+            lastStatus,
+            fileInfo.LastWriteTimeUtc);
     }
 
     private static string ResolveOvpnPath(OpenVpnSession session)
@@ -592,6 +723,24 @@ internal static class Program
         public string Content { get; private set; }
         public int TotalIpCount { get; private set; }
         public List<DomainResolution> Resolutions { get; private set; }
+    }
+
+    private sealed class LogSessionState
+    {
+        public LogSessionState(string profileName, string logPath, bool isConnected, string lastStatus, DateTime lastWriteTimeUtc)
+        {
+            ProfileName = profileName;
+            LogPath = logPath;
+            IsConnected = isConnected;
+            LastStatus = lastStatus;
+            LastWriteTimeUtc = lastWriteTimeUtc;
+        }
+
+        public string ProfileName { get; private set; }
+        public string LogPath { get; private set; }
+        public bool IsConnected { get; private set; }
+        public string LastStatus { get; private set; }
+        public DateTime LastWriteTimeUtc { get; private set; }
     }
 
     private sealed class ConnectionProbe
